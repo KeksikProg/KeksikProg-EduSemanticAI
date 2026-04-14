@@ -12,12 +12,15 @@ from docx import Document as DocxDocument
 __all__ = ["parse_document", "postprocess_document", "parse_docx_document"]
 
 
+DOC_TYPE = "курсовой проект"
+
 TOC_RE_WITH_NUM = re.compile(
     r"^(?P<num>\d+(\.\d+)*)\s+(?P<title>.+?)\s+\.{3,}\s*(?P<page>\d+)\s*$"
 )
 TOC_RE_NO_NUM = re.compile(r"^(?P<title>.+?)\s+\.{3,}\s*(?P<page>\d+)\s*$")
 HEADING_RE = re.compile(r"^(?P<num>\d+(\.\d+)*)(\.?)\s+(?P<title>.+)$")
 PAGE_NUMBER_LINE_RE = re.compile(r"^\s*\d+\s*$")
+GROUP_RE = re.compile(r"[А-Яа-я]{2,5}-\d{3}")
 
 
 @dataclass
@@ -141,6 +144,27 @@ def _split_pages_by_toc_items(pages: List[str], items: List[TocItem]) -> List[Pd
     return sections
 
 
+def _flat_section_to_dict(
+    *,
+    title: str,
+    raw_title: str,
+    number: Optional[str],
+    level: int,
+    start_page: Optional[int],
+    end_page: Optional[int],
+    text: str,
+) -> Dict[str, Any]:
+    return {
+        "title": title,
+        "raw_title": raw_title,
+        "number": number,
+        "level": level,
+        "start_page": start_page,
+        "end_page": end_page,
+        "text": text,
+    }
+
+
 def _build_hierarchical_sections_from_flat(
     sections_flat: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -166,24 +190,23 @@ def _build_hierarchical_sections_from_flat(
             }
             result.append(node)
             current_parent = node
+            continue
+
+        node = {
+            "id": sec_id,
+            "number": number,
+            "level": 2,
+            "title": title,
+            "start_page": sec.get("start_page"),
+            "end_page": sec.get("end_page"),
+            "text": sec.get("text", ""),
+        }
+        if current_parent is not None:
+            current_parent["subsections"].append(node)
         else:
-            node = {
-                "id": sec_id,
-                "number": number,
-                "level": 2,
-                "title": title,
-                "start_page": sec.get("start_page"),
-                "end_page": sec.get("end_page"),
-                "text": sec.get("text", ""),
-            }
-            if current_parent is not None:
-                current_parent["subsections"].append(node)
-            else:
-                result.append(node)
+            result.append(node)
 
     return result
-
-GROUP_RE = re.compile(r"[А-Яа-я]{2,5}-\d{3}")
 
 
 def _guess_title_and_author_from_pdf_pages(pages: List[str]) -> Tuple[str, str]:
@@ -231,6 +254,7 @@ def _guess_title_and_author_from_pdf_pages(pages: List[str]) -> Tuple[str, str]:
 
     return title, author
 
+
 def _parse_pdf_document(path: str) -> Dict[str, Any]:
     pages = _extract_pdf_pages(path)
 
@@ -244,21 +268,22 @@ def _parse_pdf_document(path: str) -> Dict[str, Any]:
 
     flat = _split_pages_by_toc_items(pages, toc_items)
     flat_dicts: List[Dict[str, Any]] = [
-        {
-            "title": s.raw_title,
-            "raw_title": s.raw_title,
-            "number": s.number,
-            "level": s.level,
-            "start_page": s.start_page,
-            "end_page": s.end_page,
-            "text": s.text,
-        }
+        _flat_section_to_dict(
+            title=s.raw_title,
+            raw_title=s.raw_title,
+            number=s.number,
+            level=s.level,
+            start_page=s.start_page,
+            end_page=s.end_page,
+            text=s.text,
+        )
         for s in flat
     ]
+
     sections = _build_hierarchical_sections_from_flat(flat_dicts)
     title, author = _guess_title_and_author_from_pdf_pages(pages)
 
-    return {"title": title, "author": author, "type": "курсовой проект", "sections": sections}
+    return {"title": title, "author": author, "type": DOC_TYPE, "sections": sections}
 
 
 def _extract_headings(doc: DocxDocument) -> List[HeadingItem]:
@@ -297,21 +322,22 @@ def _assign_missing_subnumbers(headings: List[HeadingItem]) -> None:
     current_parent_num: Optional[str] = None
     sub_counter = 0
 
-    for h in headings:
-        if h.level == 1:
-            current_parent_num = h.number
+    for heading in headings:
+        if heading.level == 1:
+            current_parent_num = heading.number
             sub_counter = 0
-        elif h.level == 2:
-            if h.number is None and current_parent_num is not None:
-                sub_counter += 1
-                h.number = f"{current_parent_num}.{sub_counter}"
+            continue
+
+        if heading.level == 2 and heading.number is None and current_parent_num is not None:
+            sub_counter += 1
+            heading.number = f"{current_parent_num}.{sub_counter}"
 
 
 def _build_flat_docx_sections(doc: DocxDocument, headings: List[HeadingItem]) -> List[DocxSectionFlat]:
     sections: List[DocxSectionFlat] = []
 
-    for idx, h in enumerate(headings):
-        start_idx = h.para_idx
+    for idx, heading in enumerate(headings):
+        start_idx = heading.para_idx
         if idx + 1 < len(headings):
             end_idx = headings[idx + 1].para_idx - 1
         else:
@@ -322,9 +348,9 @@ def _build_flat_docx_sections(doc: DocxDocument, headings: List[HeadingItem]) ->
 
         sections.append(
             DocxSectionFlat(
-                raw_title=h.title,
-                number=h.number,
-                level=h.level,
+                raw_title=heading.title,
+                number=heading.number,
+                level=heading.level,
                 text=text,
                 start_page=None,
                 end_page=None,
@@ -340,14 +366,14 @@ def _guess_title_and_author_from_docx(doc: DocxDocument) -> Tuple[str, str]:
 
     texts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
 
-    for t in texts:
-        if "ВАРИАНТ" in t.upper():
-            title = re.sub(r"(?i)вариант", "", t).strip(" :.-")
+    for text in texts:
+        if "ВАРИАНТ" in text.upper():
+            title = re.sub(r"(?i)вариант", "", text).strip(" :.-")
             break
 
-    for t in texts:
-        if "СТУДЕНТ ГРУППЫ" in t.upper():
-            rest = re.split(r"(?i)студент группы", t, maxsplit=1)[-1].strip()
+    for text in texts:
+        if "СТУДЕНТ ГРУППЫ" in text.upper():
+            rest = re.split(r"(?i)студент группы", text, maxsplit=1)[-1].strip()
             parts = rest.split()
 
             if parts and GROUP_RE.fullmatch(parts[0]):
@@ -372,22 +398,22 @@ def parse_docx_document(path: str) -> Dict[str, Any]:
     flat = _build_flat_docx_sections(doc, headings)
 
     flat_dicts: List[Dict[str, Any]] = [
-        {
-            "title": s.raw_title,
-            "raw_title": s.raw_title,
-            "number": s.number,
-            "level": s.level,
-            "start_page": s.start_page,
-            "end_page": s.end_page,
-            "text": s.text,
-        }
+        _flat_section_to_dict(
+            title=s.raw_title,
+            raw_title=s.raw_title,
+            number=s.number,
+            level=s.level,
+            start_page=s.start_page,
+            end_page=s.end_page,
+            text=s.text,
+        )
         for s in flat
     ]
 
     sections = _build_hierarchical_sections_from_flat(flat_dicts)
     title, author = _guess_title_and_author_from_docx(doc)
 
-    return {"title": title, "author": author, "type": "курсовой проект", "sections": sections}
+    return {"title": title, "author": author, "type": DOC_TYPE, "sections": sections}
 
 
 def parse_document(path: str) -> Dict[str, Any]:
@@ -427,9 +453,9 @@ def postprocess_document(doc: Dict[str, Any]) -> Dict[str, Any]:
             section["text"] = _clean_text_page_numbers(section["text"])
 
         subsections: List[Dict[str, Any]] = section.get("subsections") or []
-        for sub in subsections:
-            if isinstance(sub.get("text"), str):
-                sub["text"] = _clean_text_page_numbers(sub["text"])
+        for subsection in subsections:
+            if isinstance(subsection.get("text"), str):
+                subsection["text"] = _clean_text_page_numbers(subsection["text"])
 
         if section.get("level") == 1:
             _sync_section_pages(section)
